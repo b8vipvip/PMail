@@ -3,6 +3,7 @@ package smtp_server
 import (
 	"database/sql"
 	"errors"
+	"github.com/Jinnrry/pmail/config"
 	"github.com/Jinnrry/pmail/db"
 	"github.com/Jinnrry/pmail/models"
 	"github.com/Jinnrry/pmail/utils/context"
@@ -19,16 +20,11 @@ import (
 type Backend struct{}
 
 func (bkd *Backend) NewSession(conn *smtp.Conn) (smtp.Session, error) {
-
 	remoteAddress := conn.Conn().RemoteAddr()
 	ctx := &context.Context{}
 	ctx.SetValue(context.LogID, id.GenLogID())
 	log.WithContext(ctx).Debugf("新SMTP连接")
-
-	return &Session{
-		RemoteAddress: remoteAddress,
-		Ctx:           ctx,
-	}, nil
+	return &Session{RemoteAddress: remoteAddress, Ctx: ctx}, nil
 }
 
 // A Session is returned after EHLO.
@@ -40,13 +36,10 @@ type Session struct {
 	Ctx           *context.Context
 }
 
-// AuthMechanisms returns a slice of available auth mechanisms
-// supported in this example.
 func (s *Session) AuthMechanisms() []string {
 	return []string{sasl.Plain, sasl.Login}
 }
 
-// Auth is the handler for supported authenticators.
 func (s *Session) Auth(mech string) (sasl.Server, error) {
 	log.WithContext(s.Ctx).Debugf("Auth :%s", mech)
 	if mech == sasl.Plain {
@@ -54,64 +47,106 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 			return s.AuthPlain(username, password)
 		}), nil
 	}
-
 	if mech == sasl.Login {
 		return NewLoginServer(func(username, password string) error {
 			return s.AuthPlain(username, password)
 		}), nil
 	}
-
 	return nil, errors.New("Auth Not Supported")
 }
 
 func (s *Session) AuthPlain(username, pwd string) error {
-	log.WithContext(s.Ctx).Debugf("Auth %s %s", username, pwd)
+	// Never log SMTP passwords or authorization payloads.
+	log.WithContext(s.Ctx).Debugf("Auth attempt username=%s", username)
 
-	s.User = username
-
-	var user models.User
-
-	encodePwd := password.Encode(pwd)
-
+	lookupAccount := username
 	infos := strings.Split(username, "@")
 	if len(infos) > 1 {
-		username = infos[0]
+		lookupAccount = infos[0]
 	}
 
-	_, err := db.Instance.Where("account =? and password =? and disabled=0", username, encodePwd).Get(&user)
+	var user models.User
+	encodePwd := password.Encode(pwd)
+	_, err := db.Instance.Where("account =? and password =? and disabled=0", lookupAccount, encodePwd).Get(&user)
 	if err != nil && err != sql.ErrNoRows {
 		log.Errorf("%+v", err)
 	}
 
 	if user.ID > 0 {
+		s.User = username
 		s.Ctx.UserAccount = user.Account
 		s.Ctx.UserID = user.ID
 		s.Ctx.UserName = user.Name
 		s.Ctx.IsAdmin = user.IsAdmin == 1
-
-		log.WithContext(s.Ctx).Debugf("Auth Success %+v", user)
+		log.WithContext(s.Ctx).Debugf("Auth Success account=%s user_id=%d admin=%t", user.Account, user.ID, s.Ctx.IsAdmin)
 		return nil
 	}
 
-	log.WithContext(s.Ctx).Debugf("登陆错误%s %s", username, pwd)
+	log.WithContext(s.Ctx).Debugf("Auth failed username=%s", lookupAccount)
 	return errors.New("password error")
 }
 
 func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
-	log.WithContext(s.Ctx).Debugf("Mail Success %+v %+v", from, opts)
+	log.WithContext(s.Ctx).Debugf("Mail From=%s", from)
 	s.From = from
 	return nil
 }
 
 func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
-	log.WithContext(s.Ctx).Debugf("Rcpt Success %+v", to)
+	account, domain, ok := splitSMTPAddress(to)
+	if !ok {
+		return &smtp.SMTPError{Code: 553, EnhancedCode: smtp.EnhancedCode{5, 1, 3}, Message: "Invalid recipient address"}
+	}
 
+	local := isLocalDomain(domain)
+	if s.Ctx.UserID <= 0 && !local {
+		log.WithContext(s.Ctx).Warnf("Relay denied for unauthenticated recipient: %s", to)
+		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Relaying denied"}
+	}
+
+	if local {
+		var user models.User
+		has, err := db.Instance.Where("LOWER(account)=? and disabled=0", strings.ToLower(account)).Get(&user)
+		if err != nil {
+			log.WithContext(s.Ctx).Errorf("Recipient lookup failed for %s: %v", to, err)
+			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary local recipient lookup failure"}
+		}
+		if !has || user.ID <= 0 {
+			log.WithContext(s.Ctx).Infof("Unknown local recipient rejected at RCPT: %s", to)
+			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "User unknown"}
+		}
+	}
+
+	log.WithContext(s.Ctx).Debugf("Rcpt accepted %s", to)
 	s.To = append(s.To, to)
 	return nil
 }
 
-func (s *Session) Reset() {}
+func (s *Session) Reset() {
+	s.From = ""
+	s.To = nil
+}
 
 func (s *Session) Logout() error {
 	return nil
+}
+
+func splitSMTPAddress(address string) (account, domain string, ok bool) {
+	address = strings.TrimSpace(strings.Trim(address, "<>"))
+	at := strings.LastIndex(address, "@")
+	if at <= 0 || at >= len(address)-1 {
+		return "", "", false
+	}
+	account = strings.TrimSpace(address[:at])
+	domain = strings.ToLower(strings.TrimSpace(address[at+1:]))
+	return account, domain, account != "" && domain != ""
+}
+
+func isLocalDomain(domain string) bool {
+	for _, localDomain := range config.Instance.Domains {
+		if strings.EqualFold(strings.TrimSpace(localDomain), domain) {
+			return true
+		}
+	}
+	return false
 }
