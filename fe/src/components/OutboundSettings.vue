@@ -17,8 +17,8 @@
     <el-form label-position="top" class="settings-form">
       <el-form-item label="外发模式">
         <el-radio-group v-model="form.mode">
-          <el-radio-button value="direct">Direct MX</el-radio-button>
-          <el-radio-button value="relay">SMTP Relay</el-radio-button>
+          <el-radio-button label="direct">Direct MX</el-radio-button>
+          <el-radio-button label="relay">SMTP Relay</el-radio-button>
         </el-radio-group>
       </el-form-item>
 
