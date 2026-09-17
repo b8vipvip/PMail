@@ -28,7 +28,6 @@ func router(mux *http.ServeMux) {
 		panic(err)
 	}
 	mux.Handle("/", http.FileServer(http.FS(fe)))
-	// 挑战请求类似这样 /.well-known/acme-challenge/QPyMAyaWw9s5JvV1oruyqWHG7OqkHMJEHPoUz2046KM
 	mux.HandleFunc("/.well-known/", controllers.AcmeChallenge)
 	mux.HandleFunc("/api/ping", controllers.Ping)
 	mux.HandleFunc("/api/login", contextIterceptor(controllers.Login))
@@ -44,6 +43,7 @@ func router(mux *http.ServeMux) {
 	mux.HandleFunc("/api/email/move", contextIterceptor(email.Move))
 	mux.HandleFunc("/api/email/send", contextIterceptor(email.Send))
 	mux.HandleFunc("/api/settings/modify_password", contextIterceptor(controllers.ModifyPassword))
+	mux.HandleFunc("/api/settings/outbound", contextIterceptor(controllers.OutboundSettings))
 	mux.HandleFunc("/api/rule/get", contextIterceptor(controllers.GetRule))
 	mux.HandleFunc("/api/rule/add", contextIterceptor(controllers.UpsertRule))
 	mux.HandleFunc("/api/rule/update", contextIterceptor(controllers.UpsertRule))
@@ -60,33 +60,25 @@ func router(mux *http.ServeMux) {
 
 func HttpStart() {
 	mux := http.NewServeMux()
-
 	HttpPort := 80
 	if config.Instance.HttpPort > 0 {
 		HttpPort = config.Instance.HttpPort
 	}
 
 	if config.Instance.HttpsEnabled != 2 {
-		// 在重定向模式下，也必须显式处理 ACME 挑战，避免跳转导致验证失败
 		mux.HandleFunc("/.well-known/", controllers.AcmeChallenge)
 		mux.HandleFunc("/api/ping", controllers.Ping)
 		mux.HandleFunc("/", controllers.Interceptor)
 		httpServer = &http.Server{
-			Addr:         fmt.Sprintf(":%d", HttpPort),
-			Handler:      mux,
-			ReadTimeout:  time.Second * 90,
-			WriteTimeout: time.Second * 90,
+			Addr: fmt.Sprintf(":%d", HttpPort), Handler: mux,
+			ReadTimeout: time.Second * 90, WriteTimeout: time.Second * 90,
 		}
 	} else {
-
 		router(mux)
-
 		log.Infof("HttpServer Start On Port :%d", HttpPort)
 		httpServer = &http.Server{
-			Addr:         fmt.Sprintf(":%d", HttpPort),
-			Handler:      session.Instance.LoadAndSave(mux),
-			ReadTimeout:  time.Second * 90,
-			WriteTimeout: time.Second * 90,
+			Addr: fmt.Sprintf(":%d", HttpPort), Handler: session.Instance.LoadAndSave(mux),
+			ReadTimeout: time.Second * 90, WriteTimeout: time.Second * 90,
 		}
 	}
 
