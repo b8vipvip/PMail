@@ -24,6 +24,12 @@ type outboundSettingsRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Security string `json:"security"`
+
+	TencentSecretID    string `json:"tencent_secret_id"`
+	TencentSecretKey   string `json:"tencent_secret_key"`
+	TencentRegion      string `json:"tencent_region"`
+	TencentFromAddress string `json:"tencent_from_address"`
+	TencentTriggerType int    `json:"tencent_trigger_type"`
 }
 
 func ModifyPassword(ctx *context.Context, w http.ResponseWriter, req *http.Request) {
@@ -50,7 +56,7 @@ func ModifyPassword(ctx *context.Context, w http.ResponseWriter, req *http.Reque
 }
 
 // OutboundSettings returns or updates the outbound delivery configuration.
-// Relay credentials are admin-only and the saved password is never returned.
+// SMTP and Tencent SES credentials are admin-only; secret values are never returned.
 func OutboundSettings(ctx *context.Context, w http.ResponseWriter, req *http.Request) {
 	if !ctx.IsAdmin {
 		response.NewErrorResponse(response.NoAccessPrivileges, "admin required", "").FPrint(w)
@@ -81,15 +87,20 @@ func OutboundSettings(ctx *context.Context, w http.ResponseWriter, req *http.Req
 		}
 
 		next := outbound.Config{
-			Mode:     input.Mode,
-			Host:     input.Host,
-			Port:     input.Port,
-			Username: input.Username,
-			Password: input.Password,
-			Security: input.Security,
+			Mode:                   input.Mode,
+			Host:                   input.Host,
+			Port:                   input.Port,
+			Username:               input.Username,
+			Password:               input.Password,
+			Security:               input.Security,
+			TencentSecretID:        input.TencentSecretID,
+			TencentSecretKey:       input.TencentSecretKey,
+			TencentRegion:          input.TencentRegion,
+			TencentFromAddress:     input.TencentFromAddress,
+			TencentTriggerType:     input.TencentTriggerType,
 		}
-		// An empty password means "keep the existing secret". This lets the UI
-		// edit host/port/security without ever reading the stored password back.
+		// Empty secret fields mean "keep the existing secret". The UI can edit
+		// non-secret settings without ever reading stored credentials back.
 		if err = outbound.Save(next, true); err != nil {
 			response.NewErrorResponse(response.ParamsError, "invalid outbound settings", err.Error()).FPrint(w)
 			return
@@ -99,7 +110,11 @@ func OutboundSettings(ctx *context.Context, w http.ResponseWriter, req *http.Req
 			response.NewErrorResponse(response.ServerError, "read outbound settings failed", err.Error()).FPrint(w)
 			return
 		}
-		log.WithContext(ctx).Infof("Outbound settings updated: mode=%s host=%s port=%d security=%s username_set=%t password_set=%t", cfg.Mode, cfg.Host, cfg.Port, cfg.Security, cfg.Username != "", cfg.PasswordSet)
+		log.WithContext(ctx).Infof(
+			"Outbound settings updated: mode=%s relay_host=%s relay_port=%d relay_security=%s relay_username_set=%t relay_password_set=%t tencent_region=%s tencent_sender_set=%t tencent_secret_id_set=%t tencent_secret_key_set=%t",
+			cfg.Mode, cfg.Host, cfg.Port, cfg.Security, cfg.Username != "", cfg.PasswordSet,
+			cfg.TencentRegion, cfg.TencentFromAddress != "", cfg.TencentSecretID != "", cfg.TencentSecretKeySet,
+		)
 		response.NewSuccessResponse(cfg).FPrint(w)
 		return
 
