@@ -42,7 +42,8 @@ func DkimGen() string {
 		err     error
 	)
 
-	privKey, err = rsa.GenerateKey(rand.Reader, 1024)
+	// RFC 8301 recommends at least 2048-bit RSA keys for DKIM signing.
+	privKey, err = rsa.GenerateKey(rand.Reader, 2048)
 
 	if err != nil {
 		log.Fatalf("Failed to generate key: %v", err)
