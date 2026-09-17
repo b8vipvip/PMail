@@ -3,6 +3,7 @@ package outbound
 import (
 	"encoding/json"
 	"errors"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,8 +15,12 @@ import (
 const (
 	ModeDirect       = "direct"
 	ModeRelay        = "relay"
+	ModeTencentSES   = "tencent_ses"
 	SecuritySTARTTLS = "starttls"
 	SecurityTLS      = "tls"
+
+	TencentRegionGuangzhou = "ap-guangzhou"
+	TencentRegionHongKong  = "ap-hongkong"
 )
 
 type Config struct {
@@ -25,6 +30,12 @@ type Config struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Security string `json:"security"`
+
+	TencentSecretID    string `json:"tencent_secret_id"`
+	TencentSecretKey   string `json:"tencent_secret_key"`
+	TencentRegion      string `json:"tencent_region"`
+	TencentFromAddress string `json:"tencent_from_address"`
+	TencentTriggerType int    `json:"tencent_trigger_type"`
 }
 
 type PublicConfig struct {
@@ -34,15 +45,23 @@ type PublicConfig struct {
 	Username    string `json:"username"`
 	PasswordSet bool   `json:"password_set"`
 	Security    string `json:"security"`
+
+	TencentSecretID     string `json:"tencent_secret_id"`
+	TencentSecretKeySet bool   `json:"tencent_secret_key_set"`
+	TencentRegion       string `json:"tencent_region"`
+	TencentFromAddress  string `json:"tencent_from_address"`
+	TencentTriggerType  int    `json:"tencent_trigger_type"`
 }
 
 var mu sync.Mutex
 
 func defaultConfig() Config {
 	return Config{
-		Mode:     ModeDirect,
-		Port:     587,
-		Security: SecuritySTARTTLS,
+		Mode:               ModeDirect,
+		Port:               587,
+		Security:           SecuritySTARTTLS,
+		TencentRegion:      TencentRegionGuangzhou,
+		TencentTriggerType: 0,
 	}
 }
 
@@ -62,16 +81,23 @@ func GetPublic() (PublicConfig, error) {
 		return PublicConfig{}, err
 	}
 	return PublicConfig{
-		Mode:        cfg.Mode,
-		Host:        cfg.Host,
-		Port:        cfg.Port,
-		Username:    cfg.Username,
-		PasswordSet: cfg.Password != "",
-		Security:    cfg.Security,
+		Mode:                  cfg.Mode,
+		Host:                  cfg.Host,
+		Port:                  cfg.Port,
+		Username:              cfg.Username,
+		PasswordSet:           cfg.Password != "",
+		Security:              cfg.Security,
+		TencentSecretID:       cfg.TencentSecretID,
+		TencentSecretKeySet:   cfg.TencentSecretKey != "",
+		TencentRegion:         cfg.TencentRegion,
+		TencentFromAddress:    cfg.TencentFromAddress,
+		TencentTriggerType:    cfg.TencentTriggerType,
 	}, nil
 }
 
-func Save(next Config, keepExistingPassword bool) error {
+// Save writes outbound secrets to config/outbound.json with mode 0600.
+// When keepExistingSecrets is true, empty secret fields preserve their current values.
+func Save(next Config, keepExistingSecrets bool) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -79,8 +105,13 @@ func Save(next Config, keepExistingPassword bool) error {
 	if err != nil {
 		return err
 	}
-	if keepExistingPassword && next.Password == "" {
-		next.Password = current.Password
+	if keepExistingSecrets {
+		if next.Password == "" {
+			next.Password = current.Password
+		}
+		if next.TencentSecretKey == "" {
+			next.TencentSecretKey = current.TencentSecretKey
+		}
 	}
 	if err := normalizeAndValidate(&next); err != nil {
 		return err
@@ -132,6 +163,10 @@ func normalizeAndValidate(cfg *Config) error {
 	cfg.Host = strings.TrimSpace(cfg.Host)
 	cfg.Username = strings.TrimSpace(cfg.Username)
 	cfg.Security = strings.ToLower(strings.TrimSpace(cfg.Security))
+	cfg.TencentSecretID = strings.TrimSpace(cfg.TencentSecretID)
+	cfg.TencentSecretKey = strings.TrimSpace(cfg.TencentSecretKey)
+	cfg.TencentRegion = strings.ToLower(strings.TrimSpace(cfg.TencentRegion))
+	cfg.TencentFromAddress = strings.TrimSpace(cfg.TencentFromAddress)
 
 	if cfg.Mode == "" {
 		cfg.Mode = ModeDirect
@@ -146,21 +181,47 @@ func normalizeAndValidate(cfg *Config) error {
 			cfg.Port = 587
 		}
 	}
+	if cfg.TencentRegion == "" {
+		cfg.TencentRegion = TencentRegionGuangzhou
+	}
 
-	if cfg.Mode != ModeDirect && cfg.Mode != ModeRelay {
-		return errors.New("outbound mode must be direct or relay")
+	if cfg.Mode != ModeDirect && cfg.Mode != ModeRelay && cfg.Mode != ModeTencentSES {
+		return errors.New("outbound mode must be direct, relay or tencent_ses")
 	}
 	if cfg.Mode == ModeDirect {
 		return nil
 	}
-	if cfg.Host == "" {
-		return errors.New("SMTP relay host is required")
+	if cfg.Mode == ModeRelay {
+		if cfg.Host == "" {
+			return errors.New("SMTP relay host is required")
+		}
+		if cfg.Port < 1 || cfg.Port > 65535 {
+			return errors.New("SMTP relay port is invalid")
+		}
+		if cfg.Security != SecuritySTARTTLS && cfg.Security != SecurityTLS {
+			return errors.New("SMTP relay security must be starttls or tls")
+		}
+		return nil
 	}
-	if cfg.Port < 1 || cfg.Port > 65535 {
-		return errors.New("SMTP relay port is invalid")
+
+	if cfg.TencentSecretID == "" {
+		return errors.New("Tencent SES SecretId is required")
 	}
-	if cfg.Security != SecuritySTARTTLS && cfg.Security != SecurityTLS {
-		return errors.New("SMTP relay security must be starttls or tls")
+	if cfg.TencentSecretKey == "" {
+		return errors.New("Tencent SES SecretKey is required")
+	}
+	if cfg.TencentRegion != TencentRegionGuangzhou && cfg.TencentRegion != TencentRegionHongKong {
+		return errors.New("Tencent SES region must be ap-guangzhou or ap-hongkong")
+	}
+	if cfg.TencentFromAddress == "" {
+		return errors.New("Tencent SES sender address is required")
+	}
+	parsed, err := mail.ParseAddress(cfg.TencentFromAddress)
+	if err != nil || !strings.Contains(parsed.Address, "@") {
+		return errors.New("Tencent SES sender address is invalid")
+	}
+	if cfg.TencentTriggerType != 0 && cfg.TencentTriggerType != 1 {
+		return errors.New("Tencent SES trigger type must be 0 or 1")
 	}
 	return nil
 }
