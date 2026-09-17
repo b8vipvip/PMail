@@ -1,6 +1,7 @@
 package send
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -18,12 +19,17 @@ import (
 
 const relayIOTimeout = 30 * time.Second
 
-// tryRelay handles delivery when authenticated SMTP relay mode is enabled.
-// It returns handled=false when PMail should continue with direct-to-MX delivery.
+// tryRelay is the outbound provider switch used before direct MX lookup.
+// It handles authenticated SMTP relay and Tencent SES API modes, and returns
+// handled=false only when PMail should continue with direct-to-MX delivery.
 func tryRelay(ctx *context.Context, fromDomain string, data []byte, to []*parsemail.User, from string) (handled bool, deliveryErr error, domainErrors map[string]error) {
 	cfg, err := outbound.Get()
 	if err != nil {
-		return true, fmt.Errorf("load outbound relay configuration: %w", err), map[string]error{"relay": err}
+		return true, fmt.Errorf("load outbound configuration: %w", err), map[string]error{"outbound": err}
+	}
+
+	if cfg.Mode == outbound.ModeTencentSES {
+		return deliverTencentSESRaw(ctx, cfg, data, to, from)
 	}
 	if cfg.Mode != outbound.ModeRelay {
 		return false, nil, nil
@@ -46,6 +52,48 @@ func tryRelay(ctx *context.Context, fromDomain string, data []byte, to []*parsem
 	}
 
 	log.WithContext(ctx).Infof("Outbound relay accepted message: host=%s recipients=%d", cfg.Host, len(recipients))
+	return true, nil, domainErrors
+}
+
+func deliverTencentSESRaw(ctx *context.Context, cfg outbound.Config, data []byte, recipients []*parsemail.User, envelopeFrom string) (bool, error, map[string]error) {
+	if len(recipients) == 0 {
+		err := errors.New("Tencent SES has no recipients")
+		return true, err, map[string]error{"tencent_ses": err}
+	}
+
+	// Parse the already-built RFC message so the SES backend preserves the
+	// compose subject/body/attachments. Envelope recipients are applied below
+	// so Bcc remains available even though it is intentionally absent from the
+	// RFC message headers.
+	email := parsemail.NewEmailFromReader(nil, bytes.NewReader(data), len(data))
+	if email.From == nil || strings.TrimSpace(email.From.EmailAddress) == "" {
+		email.From = &parsemail.User{EmailAddress: envelopeFrom}
+	}
+
+	visible := map[string]struct{}{}
+	for _, user := range append(append([]*parsemail.User{}, email.To...), email.Cc...) {
+		if user != nil {
+			visible[strings.ToLower(strings.TrimSpace(user.EmailAddress))] = struct{}{}
+		}
+	}
+	email.Bcc = nil
+	for _, user := range recipients {
+		if user == nil || strings.TrimSpace(user.EmailAddress) == "" {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(user.EmailAddress))
+		if _, ok := visible[key]; !ok {
+			email.Bcc = append(email.Bcc, user)
+		}
+	}
+
+	log.WithContext(ctx).Infof("Tencent SES API delivery: region=%s recipients=%d", cfg.TencentRegion, len(recipients))
+	err := sendTencentSES(ctx, cfg, email)
+	domainErrors := relayDomainErrors(recipients, err)
+	if err != nil {
+		log.WithContext(ctx).Errorf("Tencent SES API delivery failed: region=%s error=%v", cfg.TencentRegion, err)
+		return true, err, domainErrors
+	}
 	return true, nil, domainErrors
 }
 
