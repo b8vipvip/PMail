@@ -29,7 +29,7 @@ jobs:
       postgres:
         image: postgres
         env:
-          POSTGRESQL_PASSWORD: githubTest
+          POSTGRES_PASSWORD: githubTest
     container:
       image: golang
     env:
